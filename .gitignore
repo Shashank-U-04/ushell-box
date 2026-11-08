@@ -1,0 +1,5 @@
+# local state when running with BOX_ROOT=./.box
+.box/
+# editor leftovers
+*.swp
+*~
