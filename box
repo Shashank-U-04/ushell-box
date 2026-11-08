@@ -213,3 +213,81 @@ init_dirs() {
     esac
 }
 
+# =============================================================================
+#  §5  Container state store
+#      $BOX_ROOT/containers/<id>/config  — KEY=VALUE lines (never `source`d)
+#      $BOX_ROOT/containers/<id>/cmd     — argv, NUL-separated
+#      $BOX_ROOT/containers/<id>/volumes — host:ctr[:ro] per line
+# =============================================================================
+cdir_of()  { printf '%s/%s\n' "$CONTAINERS_DIR" "$1"; }
+
+state_get() {   # id KEY → value (empty if unset)
+    local f="$CONTAINERS_DIR/$1/config"
+    [[ -f $f ]] || return 0
+    K="$2" awk -F= '$1 == ENVIRON["K"] { sub(/^[^=]*=/, ""); print; exit }' "$f"
+}
+
+state_set() {   # id KEY VALUE [KEY VALUE ...]  — atomic (tmp + mv) under flock
+    local id=$1; shift
+    local dir="$CONTAINERS_DIR/$id" upd="" k v
+    [[ -d $dir ]] || return 0
+    while (( $# >= 2 )); do
+        k=$1 v=${2//$'\n'/ }
+        upd+="$k=$v"$'\n'
+        shift 2
+    done
+    {
+        flock -w 5 9 || true
+        [[ -f $dir/config ]] || : > "$dir/config"
+        UPD="$upd" awk -F= '
+            BEGIN {
+                n = split(ENVIRON["UPD"], L, "\n")
+                for (i = 1; i <= n; i++) if (L[i] != "") {
+                    k = L[i]; sub(/=.*/, "", k)
+                    v = L[i]; sub(/^[^=]*=/, "", v)
+                    if (!(k in nv)) order[++m] = k
+                    nv[k] = v
+                }
+            }
+            ($1 in nv) { if (!($1 in seen)) print $1 "=" nv[$1]; seen[$1] = 1; next }
+            { print }
+            END { for (i = 1; i <= m; i++) if (!(order[i] in seen)) print order[i] "=" nv[order[i]] }
+        ' "$dir/config" > "$dir/config.tmp" && mv -f "$dir/config.tmp" "$dir/config"
+    } 9> "$dir/.lock" || true
+}
+
+container_ids() {
+    local d
+    for d in "$CONTAINERS_DIR"/*/; do
+        [[ -f $d/config ]] && basename "$d"
+    done
+    return 0
+}
+
+resolve_container() {   # name | id | unique id-prefix → id
+    local q=${1:-} id n
+    local -a hits=()
+    [[ -n $q ]] || die "$E_USAGE" "a container name or id is required"
+    while read -r id; do
+        [[ -n $id ]] || continue
+        n=$(state_get "$id" NAME)
+        if [[ $n == "$q" || $id == "$q" ]]; then printf '%s\n' "$id"; return 0; fi
+        [[ $id == "$q"* ]] && hits+=("$id")
+    done < <(container_ids)
+    case ${#hits[@]} in
+        1) printf '%s\n' "${hits[0]}" ;;
+        0) die "$E_USAGE" "no such container: '$q'  (see: box ps -a)" ;;
+        *) die "$E_USAGE" "id prefix '$q' is ambiguous: ${hits[*]}" ;;
+    esac
+}
+
+is_running() {
+    local pid st cur
+    pid=$(state_get "$1" INIT_PID)
+    [[ $pid =~ ^[0-9]+$ && -d /proc/$pid ]] || return 1
+    st=$(state_get "$1" INIT_START)
+    [[ -z $st ]] && return 0
+    cur=$(proc_starttime "$pid") || return 1
+    [[ $cur == "$st" ]]
+}
+
