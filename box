@@ -444,3 +444,182 @@ cg_destroy() {  # id — kill stragglers, then rmdir every controller directory
     return 0
 }
 
+# =============================================================================
+#  §7  Image management  (box pull / images / rmi)
+# =============================================================================
+fetch() {       # url dest — curl preferred, wget fallback
+    local -a progress=(-sS)
+    [[ -t 2 ]] && progress=(--progress-bar)
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 3 --connect-timeout 20 "${progress[@]}" -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        if [[ -t 2 ]]; then wget -q --show-progress -O "$2" "$1"; else wget -q -O "$2" "$1"; fi
+    else
+        die "$E_RUNTIME" "neither curl nor wget is installed"
+    fi
+}
+
+fetch_stdout() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 2 --connect-timeout 20 "$1"
+    else
+        wget -qO- "$1"
+    fi
+}
+
+# Resolve an image name to:  PULL_URL  PULL_SHA256  PULL_VERSION
+resolve_alpine() {
+    local arch
+    case $(uname -m) in
+        x86_64)        arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        armv7l)        arch=armv7 ;;
+        *) die "$E_RUNTIME" "unsupported architecture $(uname -m)" ;;
+    esac
+    local base="${BOX_ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
+    local idx="$base/latest-stable/releases/$arch"
+    local yaml="" file="" sha=""
+    info "querying Alpine release index ($arch)…"
+    yaml=$(fetch_stdout "$idx/latest-releases.yaml" 2>/dev/null) || yaml=""
+    if [[ -n $yaml ]]; then
+        read -r file sha < <(awk '
+            /flavor: *alpine-minirootfs/ { f = 1 }
+            f && $1 == "file:"   { file = $2 }
+            f && $1 == "sha256:" { print file, $2; exit }' <<< "$yaml") || true
+    fi
+    if [[ -n $file && -n $sha ]]; then
+        PULL_URL="$idx/$file"
+    elif [[ $arch == x86_64 ]]; then
+        warn "release index unavailable — using pinned $ALPINE_PIN_FILE"
+        file=$ALPINE_PIN_FILE sha=$ALPINE_PIN_SHA256
+        PULL_URL="$base/$ALPINE_PIN_BRANCH/releases/x86_64/$file"
+    else
+        die "$E_RUNTIME" "could not read the Alpine release index"
+    fi
+    PULL_SHA256=$sha
+    PULL_VERSION=$(sed -E 's/^alpine-minirootfs-(.*)-[^-]+\.tar\.gz$/\1/' <<< "$file")
+}
+
+resolve_ubuntu() {
+    local arch
+    case $(uname -m) in
+        x86_64)        arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) die "$E_RUNTIME" "unsupported architecture $(uname -m)" ;;
+    esac
+    local base="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release"
+    local sums line
+    info "querying Ubuntu Base 24.04 checksums ($arch)…"
+    sums=$(fetch_stdout "$base/SHA256SUMS") || die "$E_RUNTIME" "cannot download $base/SHA256SUMS"
+    line=$(grep -E "ubuntu-base-24\.04(\.[0-9]+)?-base-$arch\.tar\.gz$" <<< "$sums" | sort -V -k2 | tail -n1) ||
+        true
+    [[ -n $line ]] || die "$E_RUNTIME" "no ubuntu-base tarball for $arch in SHA256SUMS"
+    local file=${line##*[ *]}
+    PULL_SHA256=${line%% *}
+    PULL_URL="$base/$file"
+    PULL_VERSION=$(sed -E 's/^ubuntu-base-(.*)-base-.*$/\1/' <<< "$file")
+}
+
+cmd_pull() {
+    local image=alpine force=0
+    while (( $# )); do
+        case $1 in
+            -f|--force) force=1; shift ;;
+            -h|--help)  printf 'usage: box pull [--force] [alpine|ubuntu-mini]\n'; return 0 ;;
+            -*) die "$E_USAGE" "unknown option '$1' for pull" ;;
+            *)  image=$1; shift ;;
+        esac
+    done
+    case $image in
+        alpine)                 resolve_alpine ;;
+        ubuntu-mini|ubuntu)     image=ubuntu-mini; resolve_ubuntu ;;
+        *) die "$E_USAGE" "unknown image '$image' (available: alpine, ubuntu-mini)" ;;
+    esac
+
+    local dest="$IMAGES_DIR/$image"
+    if [[ -d $dest/rootfs && $force -eq 0 ]]; then
+        ok "image '$image' already present ($(state_meta "$image" VERSION)) — use --force to re-pull"
+        return 0
+    fi
+
+    local work
+    work=$(mktemp -d "$TMP_DIR/pull.XXXXXX")
+    cleanup_push rm -rf --one-file-system -- "$work"
+    local tarball="$work/${PULL_URL##*/}"
+
+    info "downloading ${PULL_URL##*/}"
+    fetch "$PULL_URL" "$tarball" || die "$E_RUNTIME" "download failed: $PULL_URL"
+
+    info "verifying SHA-256…"
+    local got
+    got=$(sha256sum -- "$tarball" | cut -d' ' -f1)
+    [[ $got == "$PULL_SHA256" ]] || die "$E_RUNTIME" "checksum mismatch! expected $PULL_SHA256, got $got"
+    ok "checksum OK ($got)"
+
+    info "extracting root filesystem…"
+    mkdir -p "$work/image/rootfs"
+    local -a tar_opts=(--numeric-owner -xpzf)
+    if in_userns; then
+        warn "running inside a user namespace — file ownership will not be preserved"
+        tar_opts=(--no-same-owner -xzf)
+    fi
+    tar "${tar_opts[@]}" "$tarball" -C "$work/image/rootfs" ||
+        die "$E_RUNTIME" "tar extraction failed"
+
+    # Here-document: image metadata, written in one shot.
+    cat > "$work/image/image.meta" <<EOF
+NAME=$image
+VERSION=$PULL_VERSION
+ARCH=$(uname -m)
+SOURCE=$PULL_URL
+SHA256=$PULL_SHA256
+PULLED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+    if [[ -d $dest ]]; then
+        local id
+        while read -r id; do
+            [[ -n $id && $(state_get "$id" IMAGE) == "$image" ]] || continue
+            if is_running "$id"; then
+                die "$E_RUNTIME" "image '$image' is in use by running container $(state_get "$id" NAME)"
+            fi
+        done < <(container_ids)
+        rm -rf --one-file-system -- "$dest"
+    fi
+    mv -- "$work/image" "$dest"
+    local files size
+    files=$(find "$dest/rootfs" -xdev | wc -l)
+    size=$(du -sh -- "$dest/rootfs" | cut -f1)
+    ok "pulled '$image' $PULL_VERSION → $dest/rootfs  ($size, $files files)"
+}
+
+state_meta() { awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$IMAGES_DIR/$1/image.meta" 2>/dev/null || true; }
+
+cmd_images() {
+    local d name
+    printf '%s%-12s %-10s %-8s %-7s %-10s %-19s %s%s\n' "$C_B" NAME VERSION ARCH SIZE INODE PULLED PATH "$C_RST"
+    for d in "$IMAGES_DIR"/*/; do
+        [[ -d $d/rootfs ]] || continue
+        name=$(basename "$d")
+        # stat -c: %i = inode number, %y = last modification time
+        printf '%-12s %-10s %-8s %-7s %-10s %-19s %s\n' \
+            "$name" "$(state_meta "$name" VERSION)" "$(state_meta "$name" ARCH)" \
+            "$(du -sh -- "$d/rootfs" 2>/dev/null | cut -f1)" \
+            "$(stat -c '%i' -- "$d/rootfs")" \
+            "$(stat -c '%y' -- "$d/rootfs" | cut -d. -f1)" "${d%/}/rootfs"
+    done
+}
+
+cmd_rmi() {
+    (( $# )) || die "$E_USAGE" "usage: box rmi <image>"
+    local image=$1 id
+    [[ -d $IMAGES_DIR/$image ]] || die "$E_USAGE" "no such image: $image"
+    while read -r id; do
+        [[ $(state_get "$id" IMAGE) == "$image" ]] || continue
+        is_running "$id" && die "$E_RUNTIME" "image in use by running container $(state_get "$id" NAME)"
+    done < <(container_ids)
+    rm -rf --one-file-system -- "${IMAGES_DIR:?}/$image"
+    ok "removed image '$image'"
+}
+
+image_present() { [[ -d $IMAGES_DIR/$1/rootfs ]]; }
+
