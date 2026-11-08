@@ -75,3 +75,62 @@ CG_BASE="/sys/fs/cgroup"
 case ":$PATH:" in *:/usr/sbin:*) ;; *) PATH="$PATH:/usr/sbin:/sbin" ;; esac
 export PATH
 
+# =============================================================================
+#  §1  Presentation: colours & logging
+#      stdout carries *data* (tables, ids); stderr carries *diagnostics* (>&2)
+# =============================================================================
+setup_colors() {
+    if [[ -t 2 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+        C_RST=$'\033[0m' C_B=$'\033[1m' C_DIM=$'\033[2m'
+        C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m'
+        C_BLU=$'\033[34m' C_MAG=$'\033[35m' C_CYN=$'\033[36m'
+    else
+        C_RST='' C_B='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_BLU='' C_MAG='' C_CYN=''
+    fi
+}
+
+info() { [[ ${BOX_QUIET:-0} == 1 ]] || printf '%s▸%s %s\n' "$C_BLU$C_B" "$C_RST" "$*" >&2; }
+ok()   { [[ ${BOX_QUIET:-0} == 1 ]] || printf '%s✔%s %s\n' "$C_GRN$C_B" "$C_RST" "$*" >&2; }
+warn() { printf '%s⚠ warning:%s %s\n' "$C_YEL$C_B" "$C_RST" "$*" >&2; }
+err()  { printf '%s✖ error:%s %s\n'   "$C_RED$C_B" "$C_RST" "$*" >&2; }
+die()  { local code=$1; shift; err "$*"; exit "$code"; }
+
+need_val() { [[ $# -ge 2 && -n $2 ]] || die "$E_USAGE" "option '$1' requires a value"; }
+
+# =============================================================================
+#  §2  Signal handling & defensive cleanup
+#      Cleanup actions are pushed on a LIFO stack and run exactly once from the
+#      EXIT / INT / TERM / HUP traps, so a Ctrl+C at any moment unwinds cleanly.
+# =============================================================================
+_CLEANUP=()
+_IN_CLEANUP=0
+_EXIT_SIGNAL=""
+_EXIT_RC=0
+
+cleanup_push() { _CLEANUP+=("$(printf '%q ' "$@")"); }
+
+cleanup() {
+    local rc=$?
+    local sig=${1:-EXIT}
+    (( _IN_CLEANUP )) && return 0
+    _IN_CLEANUP=1
+    trap '' INT TERM HUP                      # don't let a 2nd Ctrl+C abort teardown
+    _EXIT_RC=$rc
+    [[ $sig != EXIT ]] && { _EXIT_SIGNAL=$sig; printf '\n' >&2; warn "caught SIG$sig — cleaning up"; }
+    local i
+    for (( i = ${#_CLEANUP[@]} - 1; i >= 0; i-- )); do
+        eval "${_CLEANUP[i]}" || true
+    done
+    _CLEANUP=()
+    case $sig in INT) rc=130 ;; TERM) rc=143 ;; HUP) rc=129 ;; esac
+    trap - EXIT
+    exit "$rc"
+}
+
+install_traps() {
+    trap 'cleanup EXIT' EXIT
+    trap 'cleanup INT'  INT
+    trap 'cleanup TERM' TERM
+    trap 'cleanup HUP'  HUP
+}
+
