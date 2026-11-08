@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# =============================================================================
+#
+#   ushell-box  ::  box  —  a zero-dependency, Bash-native micro-container engine
+#
+#   Course   : B24EF0506 — UNIX Shell Programming Lab, REVA University
+#   Targets  : Ubuntu 24.04 (WSL 2) · Ubuntu 22.04/24.04 (VMware) · x86_64/arm64
+#   Needs    : bash >= 4.4, util-linux (unshare, nsenter, setsid, flock),
+#              coreutils, curl|wget, tar, gzip — nothing else.
+#
+#   How a container is born (see README.md for the full diagram):
+#
+#     box run ──► supervise() ──► cgroup mkdir + limits  (memory.max / cpu.max)
+#                     │
+#                     └─ ( echo $BASHPID > cgroup.procs ; exec unshare -m -u -i ) &
+#                                     │   new mount + UTS + IPC namespaces
+#                                     └─► box __init   (host FS, host PID ns)
+#                                            ├─ mount overlay  (image = lowerdir)
+#                                            ├─ mount sysfs / tmpfs /dev / volumes
+#                                            ├─ hostname <name>
+#                                            └─ exec unshare --pid ─► reaper
+#                                                  └─ fork ─► PID 1 (new PID ns)
+#                                                       exec unshare --mount-proc
+#                                                       exec chroot <rootfs> <cmd>
+#
+#   Every mount is made *inside* the container's private mount namespace, so the
+#   kernel destroys all of them automatically when the container's last process
+#   dies — even if this engine is killed with SIGKILL. Traps then only need to
+#   reap cgroups and state, which `box cleanup` can also do after a hard crash.
+#
+#   Exit codes (deterministic):
+#     0  success                 2  permission denied / root missing
+#     1  bad arguments / usage   3  runtime or isolation error
+#   `box run` in the foreground returns the *container's* exit status instead
+#   (e.g. 137 = 128+SIGKILL, which is what an OOM-kill looks like).
+#
+# =============================================================================
+
+set -Eeuo pipefail
+shopt -s nullglob
+umask 022
+
+readonly BOX_VERSION="1.0.0"
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+
+# ----------------------------------------------------------------------------
+#  Configuration (overridable from the environment)
+# ----------------------------------------------------------------------------
+: "${BOX_ROOT:=/var/lib/ushell-box}"        # image + container state lives here
+BOX_ROOT="$(readlink -m -- "$BOX_ROOT")"
+: "${BOX_STOP_GRACE:=5}"                    # seconds between SIGTERM and SIGKILL
+: "${BOX_PIDS_MAX:=512}"                    # default fork-bomb guard (pids.max)
+: "${BOX_ROOTFS_MODE:=auto}"                # auto | overlay | copy
+: "${BOX_CGROUP:=auto}"                     # auto | v2 | v1 | none
+
+readonly IMAGES_DIR="$BOX_ROOT/images"
+readonly CONTAINERS_DIR="$BOX_ROOT/containers"
+readonly TMP_DIR="$BOX_ROOT/tmp"
+readonly CG_PARENT="ushell-box"
+readonly JAIL_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+readonly E_OK=0 E_USAGE=1 E_PERM=2 E_RUNTIME=3
+
+# Pinned fallback used only if the Alpine release index cannot be parsed.
+readonly ALPINE_PIN_BRANCH="v3.24"
+readonly ALPINE_PIN_FILE="alpine-minirootfs-3.24.4-x86_64.tar.gz"
+readonly ALPINE_PIN_SHA256="cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012"
+
+ORIG_ARGS=()
+CG_VERSION=0          # 2, 1 or 0 (none) — set by cg_detect
+CG_BASE="/sys/fs/cgroup"
+
+# chroot, mount, … live in sbin; make sure they resolve even for odd PATHs.
+case ":$PATH:" in *:/usr/sbin:*) ;; *) PATH="$PATH:/usr/sbin:/sbin" ;; esac
+export PATH
+
