@@ -819,3 +819,140 @@ supervise() {
     return "$rc"
 }
 
+# =============================================================================
+#  §9  Container lifecycle — inside the namespaces (PID 1, before chroot)
+# =============================================================================
+jail_path_ok() {    # root path → succeed if path resolves inside root
+    local r
+    r=$(realpath -m -- "$2") || return 1
+    [[ $r == "$1" || $r == "$1"/* ]]
+}
+
+jail_write() {      # root /abs/path content
+    local t="$1$2"
+    jail_path_ok "$1" "${t%/*}" || { warn "skipping $2 (escapes rootfs)"; return 0; }
+    [[ -L $t ]] && rm -f -- "$t"
+    mkdir -p -- "${t%/*}"
+    printf '%s\n' "$3" > "$t"
+}
+
+setup_dev() {       # minimal /dev: tmpfs + a few bind-mounted device nodes
+    local r=$1 d
+    mount -t tmpfs -o nosuid,mode=0755,size=4m tmpfs "$r/dev" || die "$E_RUNTIME" "cannot mount tmpfs on /dev"
+    for d in null zero full random urandom tty; do
+        [[ -e /dev/$d ]] || continue
+        : > "$r/dev/$d"
+        mount --bind "/dev/$d" "$r/dev/$d" || warn "bind /dev/$d failed"
+    done
+    ln -s /proc/self/fd   "$r/dev/fd"
+    ln -s /proc/self/fd/0 "$r/dev/stdin"
+    ln -s /proc/self/fd/1 "$r/dev/stdout"
+    ln -s /proc/self/fd/2 "$r/dev/stderr"
+    mkdir -p "$r/dev/pts" "$r/dev/shm"
+    if mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$r/dev/pts" 2>/dev/null; then
+        ln -s pts/ptmx "$r/dev/ptmx"
+    fi
+    mount -t tmpfs -o nosuid,nodev,mode=1777 shm "$r/dev/shm" 2>/dev/null || true
+}
+
+mount_volume() {    # root host:ctr[:ro]
+    local root=$1 hp cp mode t
+    IFS=: read -r hp cp mode <<< "$2"
+    t="$root$cp"
+    jail_path_ok "$root" "$t" || die "$E_RUNTIME" "volume target $cp escapes the rootfs via a symlink"
+    [[ -L $t ]] && die "$E_RUNTIME" "volume target $cp is a symlink — refusing"
+    if [[ -d $hp ]]; then
+        mkdir -p -- "$t"
+    else
+        mkdir -p -- "${t%/*}"
+        [[ -e $t ]] || : > "$t"
+    fi
+    mount --bind -- "$hp" "$t" || die "$E_RUNTIME" "bind-mount $hp → $cp failed"
+    if [[ ${mode:-rw} == ro ]]; then
+        mount -o remount,bind,ro -- "$t" || die "$E_RUNTIME" "cannot make $cp read-only"
+    fi
+}
+
+container_init() {
+    local id=${1:?} cdir name mode root lower v
+    cdir=$(cdir_of "$id")
+    [[ $(readlink /proc/self/ns/mnt) != "$(readlink /proc/1/ns/mnt)" ]] ||
+        die "$E_RUNTIME" "__init must run inside a private mount namespace"
+    name=$(state_get "$id" NAME)
+    mode=$(state_get "$id" ROOTFS_MODE)
+    root=$(state_get "$id" ROOTFS)
+    lower=$(state_get "$id" LOWER)
+    local -a cmd=() vols=()
+    mapfile -d '' -t cmd < "$cdir/cmd"
+    [[ -s $cdir/volumes ]] && mapfile -t vols < "$cdir/volumes"
+
+    # Mount events must never propagate back to the host.
+    mount --make-rprivate / 2>/dev/null || true
+
+    # 1. root filesystem: copy-on-write overlay (image stays pristine)
+    case $mode in
+        overlay) mount -t overlay overlay \
+                     -o "lowerdir=$lower,upperdir=$cdir/upper,workdir=$cdir/work" "$root" ||
+                     die "$E_RUNTIME" "overlay mount failed — retry with BOX_ROOTFS_MODE=copy" ;;
+        copy)    mount --bind "$root" "$root" || die "$E_RUNTIME" "bind mount of rootfs failed" ;;
+        *)       die "$E_RUNTIME" "unknown rootfs mode '$mode'" ;;
+    esac
+    mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/tmp" "$root/etc"
+
+    # 2. /proc is mounted at the very end, by PID 1 itself (see step 7):
+    #    a procfs instance belongs to the PID namespace of whoever mounts it.
+
+    # 3. sysfs (read-only); fall back to a read-only bind of the host's /sys
+    if ! mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$root/sys" 2>/dev/null; then
+        if mount --rbind /sys "$root/sys" 2>/dev/null; then
+            mount -o remount,bind,ro "$root/sys" 2>/dev/null || true
+        else
+            warn "/sys is not available inside the container"
+        fi
+    fi
+
+    # 4. /dev
+    setup_dev "$root"
+
+    # 5. identity: UTS hostname + /etc files (written into the overlay upper)
+    hostname "$name" 2>/dev/null ||
+        { printf '%s\n' "$name" > /proc/sys/kernel/hostname; } 2>/dev/null ||
+        warn "could not set the container hostname"
+    jail_write "$root" /etc/hostname "$name"
+    jail_write "$root" /etc/hosts "127.0.0.1	localhost
+::1	localhost ip6-localhost
+127.0.1.1	$name"
+    [[ -r /etc/resolv.conf ]] && jail_write "$root" /etc/resolv.conf "$(< /etc/resolv.conf)"
+
+    # 6. volumes
+    for v in "${vols[@]}"; do mount_volume "$root" "$v"; done
+
+    # 7. PID namespace + jail.
+    #    `unshare --pid` (without --fork) moves only our *future children* into
+    #    the new namespace; the first one we fork becomes PID 1. So a tiny
+    #    reaper shell that forks exactly once launches an exec-only chain:
+    #       [reset signals] → [pdeathsig] → unshare --mount-proc → env -i → chroot → cmd
+    #    Nothing in that chain forks, so the user's command *is* PID 1, procfs is
+    #    mounted from inside the new PID namespace, and the reaper's `wait`
+    #    reports the real exit status (128+N when killed by signal N).
+    cd -- "$root"
+    local chroot_bin; chroot_bin=$(command -v chroot)
+    local -a chain=()
+    if env --default-signal=INT true 2>/dev/null; then
+        chain+=(env --default-signal=INT,QUIT,TERM,HUP,PIPE)
+    fi
+    if command -v setpriv >/dev/null 2>&1; then
+        chain+=(setpriv --pdeathsig KILL)       # reaper dies → container dies
+    fi
+    chain+=(unshare --mount-proc="$root/proc" --
+            env -i "PATH=$JAIL_PATH" "HOME=/root" "TERM=${TERM:-xterm}"
+                "HOSTNAME=$name" "container=ushell-box" "PS1=[$name \\W]\\$ "
+                "$chroot_bin" "$root" "${cmd[@]}")
+    unset BASH_ENV ENV
+    exec unshare --pid -- "$BASH" --norc --noprofile -c '
+        trap "" INT QUIT TERM HUP
+        "$@" <&0 &
+        wait "$!" 2>/dev/null
+        exit "$?"' box-reaper "${chain[@]}"
+}
+
