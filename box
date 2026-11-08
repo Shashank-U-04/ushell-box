@@ -1503,3 +1503,33 @@ ${C_B}exit codes${C_RST}  0 ok · 1 bad arguments · 2 not root · 3 runtime/iso
 EOF
 }
 
+# =============================================================================
+#  §11  Entry point
+# =============================================================================
+main() {
+    ORIG_ARGS=("$@")
+    setup_colors
+    install_traps
+    if [[ ${BOX_DEBUG:-0} == 1 ]]; then
+        PS4='+ ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}: '
+        set -x
+    fi
+    local sub=${1:-help}
+    (( $# )) && shift
+    case $sub in
+        help|-h|--help)        usage ;;
+        version|-V|--version)  printf 'ushell-box %s\n' "$BOX_VERSION" ;;
+        __init)                container_init "$@" ;;             # inside namespaces
+        __supervise)           cg_detect; cmd_supervise "$@" ;;   # detached supervisor
+        pull|images|rmi|run|exec|ps|stats|logs|stop|rm|inspect|cleanup|info|menu)
+            require_root "$sub"
+            init_dirs
+            cg_detect
+            "cmd_$sub" "$@" ;;
+        *)  err "unknown command '$sub'"
+            usage >&2
+            exit "$E_USAGE" ;;
+    esac
+}
+
+main "$@"
