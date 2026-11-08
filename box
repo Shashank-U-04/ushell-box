@@ -291,3 +291,156 @@ is_running() {
     [[ $cur == "$st" ]]
 }
 
+# =============================================================================
+#  §6  cgroups — v2 unified hierarchy first, v1 per-controller fallback
+# =============================================================================
+cg_detect() {
+    CG_VERSION=0
+    case $BOX_CGROUP in
+        none) return 0 ;;
+        v2)   CG_VERSION=2; return 0 ;;
+        v1)   CG_VERSION=1; return 0 ;;
+    esac
+    if [[ $(fs_type "$CG_BASE") == cgroup2fs ]]; then
+        CG_VERSION=2                                   # pure unified hierarchy
+    elif [[ -d $CG_BASE/memory && $(fs_type "$CG_BASE/memory") == cgroupfs ]]; then
+        CG_VERSION=1                                   # legacy or hybrid layout
+    fi
+    return 0
+}
+
+cg_dirs() {     # id → one cgroup directory per line
+    case $CG_VERSION in
+        2) printf '%s\n' "$CG_BASE/$CG_PARENT/$1" ;;
+        1) local c
+           for c in memory cpu pids; do
+               [[ -d $CG_BASE/$c ]] && printf '%s\n' "$CG_BASE/$c/$CG_PARENT/$1"
+           done ;;
+    esac
+    return 0
+}
+
+cg_dir_for() {  # id controller → directory that holds that controller's files
+    case $CG_VERSION in
+        2) printf '%s\n' "$CG_BASE/$CG_PARENT/$1" ;;
+        1) printf '%s\n' "$CG_BASE/$2/$CG_PARENT/$1" ;;
+    esac
+}
+
+cg_write() {    # file value — quiet, returns non-zero on failure
+    { printf '%s\n' "$2" > "$1"; } 2>/dev/null
+}
+
+cg_read() {     # file → first line (empty if unreadable)
+    local v=""
+    { read -r v < "$1"; } 2>/dev/null || true
+    printf '%s\n' "$v"
+}
+
+cg_create() {   # id mem_bytes cpu_pct pids_max
+    local id=$1 mem=$2 cpu=$3 pids=$4 c d
+    case $CG_VERSION in
+    2)
+        local parent="$CG_BASE/$CG_PARENT"
+        mkdir -p "$parent" 2>/dev/null || return 1
+        # Controllers must be delegated top-down via cgroup.subtree_control.
+        for c in memory cpu pids; do
+            grep -qw "$c" "$CG_BASE/cgroup.controllers" 2>/dev/null || continue
+            grep -qw "$c" "$CG_BASE/cgroup.subtree_control" 2>/dev/null ||
+                cg_write "$CG_BASE/cgroup.subtree_control" "+$c" || true
+            grep -qw "$c" "$parent/cgroup.subtree_control" 2>/dev/null ||
+                cg_write "$parent/cgroup.subtree_control" "+$c" || true
+        done
+        mkdir "$parent/$id" 2>/dev/null || return 1
+        d="$parent/$id"
+        if [[ -n $mem ]]; then
+            cg_write "$d/memory.max" "$mem" || { warn "cannot write memory.max"; return 1; }
+            cg_write "$d/memory.swap.max" 0 || true        # no swap: cap is the real cap
+        fi
+        if [[ -n $cpu ]]; then
+            cg_write "$d/cpu.max" "$(( cpu * 1000 )) 100000" || { warn "cannot write cpu.max"; return 1; }
+        fi
+        [[ -n $pids ]] && { cg_write "$d/pids.max" "$pids" || true; }
+        ;;
+    1)
+        while read -r d; do mkdir -p "$d" 2>/dev/null || return 1; done < <(cg_dirs "$id")
+        if [[ -n $mem ]]; then
+            d=$(cg_dir_for "$id" memory)
+            cg_write "$d/memory.limit_in_bytes" "$mem" || { warn "cannot write memory.limit_in_bytes"; return 1; }
+            cg_write "$d/memory.memsw.limit_in_bytes" "$mem" || true
+            cg_write "$d/memory.swappiness" 0 || true
+        fi
+        if [[ -n $cpu ]]; then
+            d=$(cg_dir_for "$id" cpu)
+            cg_write "$d/cpu.cfs_period_us" 100000 || true
+            cg_write "$d/cpu.cfs_quota_us" "$(( cpu * 1000 ))" || { warn "cannot write cpu.cfs_quota_us"; return 1; }
+        fi
+        if [[ -n $pids && -d $CG_BASE/pids ]]; then
+            cg_write "$(cg_dir_for "$id" pids)/pids.max" "$pids" || true
+        fi
+        ;;
+    *) return 1 ;;
+    esac
+    return 0
+}
+
+cg_procs() {    # id → PIDs currently in the container's cgroup
+    local d
+    d=$(cg_dir_for "$1" memory) || return 0
+    [[ -n $d && -r $d/cgroup.procs ]] && cat -- "$d/cgroup.procs" 2>/dev/null
+    return 0
+}
+
+cg_mem_current() {
+    case $CG_VERSION in
+        2) cg_read "$(cg_dir_for "$1" memory)/memory.current" ;;
+        1) cg_read "$(cg_dir_for "$1" memory)/memory.usage_in_bytes" ;;
+    esac
+}
+
+cg_mem_peak() {
+    case $CG_VERSION in
+        2) cg_read "$(cg_dir_for "$1" memory)/memory.peak" ;;
+        1) cg_read "$(cg_dir_for "$1" memory)/memory.max_usage_in_bytes" ;;
+    esac
+}
+
+cg_oom_kills() {
+    local f
+    case $CG_VERSION in
+        2) f="$(cg_dir_for "$1" memory)/memory.events" ;;
+        1) f="$(cg_dir_for "$1" memory)/memory.oom_control" ;;
+        *) printf '0\n'; return 0 ;;
+    esac
+    [[ -r $f ]] || { printf '0\n'; return 0; }
+    awk '$1 == "oom_kill" { print $2; found = 1 } END { if (!found) print 0 }' "$f"
+}
+
+cg_cpu_usec() {
+    local d
+    case $CG_VERSION in
+        2) d=$(cg_dir_for "$1" cpu)
+           [[ -r $d/cpu.stat ]] && awk '$1 == "usage_usec" { print $2 }' "$d/cpu.stat" ;;
+        1) d=$(cg_dir_for "$1" cpu)
+           [[ -r $d/cpuacct.usage ]] && awk '{ printf "%d\n", $1 / 1000 }' "$d/cpuacct.usage" ;;
+    esac
+    return 0
+}
+
+cg_destroy() {  # id — kill stragglers, then rmdir every controller directory
+    local id=$1 d p i
+    while read -r d; do
+        [[ -n $d && -d $d ]] || continue
+        if [[ -s $d/cgroup.procs ]]; then
+            cg_write "$d/cgroup.kill" 1 || true         # v2, kernel >= 5.14
+            while read -r p; do kill -KILL "$p" 2>/dev/null || true; done 2>/dev/null < "$d/cgroup.procs"
+        fi
+        for (( i = 0; i < 30; i++ )); do
+            rmdir "$d" 2>/dev/null && break
+            sleep 0.1
+        done
+        if [[ -d $d ]]; then warn "could not remove cgroup $d"; fi
+    done < <(cg_dirs "$id")
+    return 0
+}
+
