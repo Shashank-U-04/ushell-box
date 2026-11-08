@@ -956,3 +956,550 @@ container_init() {
         exit "$?"' box-reaper "${chain[@]}"
 }
 
+# =============================================================================
+#  §10  CLI commands
+# =============================================================================
+usage_run() {
+    cat <<'EOF'
+usage: box run [OPTIONS] <image> [command [args...]]
+
+  -n, --name <name>        container name (default: box-<id>)
+  -m, --mem  <size>        memory ceiling, e.g. 50M, 256M, 1G   (memory.max)
+  -c, --cpu  <percent>     CPU quota in % of one core, e.g. 20  (cpu.max)
+  -p, --pids <n>           max processes (default $BOX_PIDS_MAX) (pids.max)
+  -v, --vols <host:ctr[:ro]>  bind-mount a host path (repeatable)
+  -d, --detach             run in background, print the container id
+      --rm                 remove the container's state when it exits
+
+examples:
+  box run alpine                                   # interactive /bin/sh
+  box run --name web --mem 64M --cpu 25 alpine sh -c 'echo hi'
+  box run -d --name worker -v "$PWD:/work:ro" alpine sleep 600
+EOF
+}
+
+cmd_run() {
+    local name="" mem="" cpu="" pids=$BOX_PIDS_MAX detach=0 autorm=0 spec hp cp mode
+    local -a vols=()
+    while (( $# )); do
+        case $1 in
+            -n|--name)  need_val "$@"; name=$2; shift 2 ;;
+            --name=*)   name=${1#*=}; shift ;;
+            -m|--mem|--memory) need_val "$@"; mem=$2; shift 2 ;;
+            --mem=*|--memory=*) mem=${1#*=}; shift ;;
+            -c|--cpu|--cpus)   need_val "$@"; cpu=$2; shift 2 ;;
+            --cpu=*)    cpu=${1#*=}; shift ;;
+            -p|--pids)  need_val "$@"; pids=$2; shift 2 ;;
+            --pids=*)   pids=${1#*=}; shift ;;
+            -v|--vol|--vols|--volume) need_val "$@"; vols+=("$2"); shift 2 ;;
+            --vols=*|--volume=*) vols+=("${1#*=}"); shift ;;
+            -d|--detach) detach=1; shift ;;
+            --rm)       autorm=1; shift ;;
+            -h|--help)  usage_run; return 0 ;;
+            --)         shift; break ;;
+            -*)         die "$E_USAGE" "unknown option '$1' (see: box run --help)" ;;
+            *)          break ;;
+        esac
+    done
+    (( $# >= 1 )) || { usage_run >&2; exit "$E_USAGE"; }
+    local image=$1; shift
+    [[ $image == ubuntu ]] && image=ubuntu-mini
+    image_present "$image" || die "$E_USAGE" "image '$image' not found — run: box pull $image"
+
+    local -a cmd=("$@")
+    if (( ${#cmd[@]} == 0 )); then
+        if [[ -x $IMAGES_DIR/$image/rootfs/bin/bash ]]; then cmd=(/bin/bash); else cmd=(/bin/sh); fi
+    fi
+
+    # ---- validation ------------------------------------------------------
+    local mem_bytes=""
+    if [[ -n $mem ]]; then
+        mem_bytes=$(parse_size "$mem") || die "$E_USAGE" "invalid --mem '$mem' (examples: 50M, 512M, 1G)"
+        (( mem_bytes >= 8 * 1024 * 1024 )) || die "$E_USAGE" "--mem must be at least 8M"
+    fi
+    if [[ -n $cpu ]]; then
+        [[ $cpu =~ ^[0-9]+$ ]] || die "$E_USAGE" "invalid --cpu '$cpu' (integer percent of one core)"
+        local ncpu; ncpu=$(nproc)
+        (( cpu >= 1 && cpu <= 100 * ncpu )) || die "$E_USAGE" "--cpu must be 1..$(( 100 * ncpu )) on this ${ncpu}-CPU host"
+    fi
+    [[ -z $pids || $pids == max || $pids =~ ^[0-9]+$ ]] || die "$E_USAGE" "invalid --pids '$pids'"
+    if [[ -n $name ]]; then
+        [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] ||
+            die "$E_USAGE" "invalid name '$name' (letters, digits, _ . -; max 63 chars)"
+    fi
+    local -a vol_lines=()
+    for spec in "${vols[@]}"; do
+        IFS=: read -r hp cp mode <<< "$spec"
+        [[ -n $hp && -n $cp ]] || die "$E_USAGE" "volume '$spec' must be <host_path>:<container_path>[:ro]"
+        [[ -e $hp ]]           || die "$E_USAGE" "volume host path does not exist: $hp"
+        [[ $cp == /* ]]        || die "$E_USAGE" "volume container path must be absolute: $cp"
+        [[ /$cp/ != */../* ]]  || die "$E_USAGE" "volume container path must not contain '..': $cp"
+        [[ -z $mode || $mode == ro || $mode == rw ]] || die "$E_USAGE" "volume mode must be ro or rw: $spec"
+        vol_lines+=("$(readlink -f -- "$hp"):$cp:${mode:-rw}")
+    done
+
+    local id; id=$(gen_id)
+    [[ -n $name ]] || name="box-${id:0:6}"
+    local other
+    while read -r other; do
+        [[ $(state_get "$other" NAME) == "$name" ]] &&
+            die "$E_USAGE" "name '$name' is already used by container $other (box rm $name)"
+    done < <(container_ids)
+
+    # ---- persist state ---------------------------------------------------
+    local cdir; cdir=$(cdir_of "$id")
+    mkdir -p -- "$cdir"
+    chmod 0700 "$cdir"
+    printf '%s\0' "${cmd[@]}" > "$cdir/cmd"
+    (( ${#vol_lines[@]} )) && printf '%s\n' "${vol_lines[@]}" > "$cdir/volumes"
+    cat > "$cdir/config" <<EOF
+ID=$id
+NAME=$name
+IMAGE=$image
+COMMAND=${cmd[*]//$'\n'/ }
+MEM_BYTES=$mem_bytes
+CPU_PCT=$cpu
+PIDS_MAX=$pids
+VOLUMES=$(IFS=,; printf '%s' "${vol_lines[*]}")
+DETACHED=$detach
+AUTO_REMOVE=$autorm
+CREATED=$(date +%s)
+STATUS=created
+EOF
+
+    if (( detach )); then
+        local log="$cdir/console.log" st="" i
+        : > "$log"
+        setsid "$BASH" "$SELF" __supervise "$id" < /dev/null >> "$log" 2>&1 &
+        for (( i = 0; i < 100; i++ )); do
+            st=$(state_get "$id" STATUS)
+            [[ $st == exited ]] && break
+            [[ $st == running && -n $(state_get "$id" INIT_PID) ]] && break
+            sleep 0.1
+        done
+        case $st in
+            running) ok "started '$name' in the background (logs: box logs $name)"
+                     printf '%s\n' "$id" ;;
+            exited)  err "container exited immediately (code $(state_get "$id" EXIT_CODE)); console output:"
+                     sed 's/^/    /' "$log" >&2 || true
+                     exit "$E_RUNTIME" ;;
+            *)       die "$E_RUNTIME" "container did not start within 10s (see $log)" ;;
+        esac
+        return 0
+    fi
+
+    local rc=0
+    supervise "$id" || rc=$?
+    return "$rc"
+}
+
+cmd_supervise() {   # internal: detached supervisor
+    local id=${1:?}
+    [[ -f $(cdir_of "$id")/config ]] || die "$E_USAGE" "no such container $id"
+    local rc=0
+    supervise "$id" || rc=$?
+    exit "$rc"
+}
+
+cmd_exec() {
+    (( $# )) || die "$E_USAGE" "usage: box exec <name|id> [command [args...]]"
+    local id; id=$(resolve_container "$1"); shift
+    is_running "$id" || die "$E_RUNTIME" "container '$(state_get "$id" NAME)' is not running"
+    local pid name f
+    pid=$(state_get "$id" INIT_PID)
+    name=$(state_get "$id" NAME)
+    local -a cmd=("$@")
+    (( ${#cmd[@]} )) || cmd=(/bin/sh)
+    local -a procs_files=()
+    while read -r f; do [[ -n $f ]] && procs_files+=("$f/cgroup.procs"); done < <(cg_dirs "$id")
+    local rc=0
+    (
+        for f in "${procs_files[@]}"; do printf '%s\n' "$BASHPID" > "$f" 2>/dev/null || true; done
+        exec env -i "PATH=$JAIL_PATH" "HOME=/root" "TERM=${TERM:-xterm}" "HOSTNAME=$name" \
+            "container=ushell-box" "PS1=[$name \\W]\\$ " \
+            nsenter --target "$pid" --mount --uts --ipc --pid --root --wd -- "${cmd[@]}"
+    ) || rc=$?
+    return "$rc"
+}
+
+cmd_ps() {
+    local all=0 quiet=0
+    while (( $# )); do
+        case $1 in
+            -a|--all)   all=1 ;;
+            -q|--quiet) quiet=1 ;;
+            -h|--help)  printf 'usage: box ps [-a|--all] [-q|--quiet]\n'; return 0 ;;
+            *) die "$E_USAGE" "unknown option '$1' for ps" ;;
+        esac
+        shift
+    done
+    local tc=0; [[ -t 1 && -z ${NO_COLOR:-} ]] && tc=1
+    local now rows="" id name image st status mem procs pidcol cmdline created lim pid nspid cur t
+    now=$(date +%s)
+    while read -r id; do
+        [[ -n $id ]] || continue
+        name=$(state_get "$id" NAME)
+        image=$(state_get "$id" IMAGE)
+        created=$(state_get "$id" CREATED)
+        st=$(state_get "$id" STATUS)
+        cmdline=$(state_get "$id" COMMAND)
+        mem="-" procs="-" pidcol="-"
+        if is_running "$id"; then
+            t=$(state_get "$id" STARTED)
+            status="Up $(duration $(( now - ${t:-$now} )))"
+            pid=$(state_get "$id" INIT_PID)
+            # NSpid lists the PID as seen from each nested namespace: host … container
+            nspid=$(awk '/^NSpid:/ { print $NF }' "/proc/$pid/status" 2>/dev/null) || nspid="?"
+            pidcol="$pid->${nspid:-?}"
+            cur=$(cg_mem_current "$id")
+            lim=$(state_get "$id" MEM_BYTES)
+            if [[ -n $cur ]]; then mem="$(human "$cur")/$(limit_h "$lim")"; fi
+            procs=$(cg_procs "$id" | wc -l)
+            [[ $procs == 0 ]] && procs="-"
+        elif [[ $st == running || $st == created ]]; then
+            (( all )) || continue
+            status="Dead (stale)"
+        else
+            (( all )) || continue
+            if [[ $(state_get "$id" OOM_KILLED) == 1 ]]; then status="OOM-killed"
+            else status="Exited($(state_get "$id" EXIT_CODE))"; fi
+            t=$(state_get "$id" FINISHED)
+            status+=" $(duration $(( now - ${t:-$now} ))) ago"
+        fi
+        (( ${#cmdline} > 28 )) && cmdline="${cmdline:0:25}..."
+        rows+="${created:-0}"$'\t'"$id"$'\t'"$name"$'\t'"$image"$'\t'"$status"$'\t'"$mem"$'\t'"$procs"$'\t'"$pidcol"$'\t'"${cmdline:--}"$'\n'
+    done < <(container_ids)
+
+    if (( quiet )); then
+        printf '%s' "$rows" | sort -t $'\t' -k1,1n | cut -f2
+        return 0
+    fi
+    printf '%s%-12s  %-16s  %-11s  %-20s  %-16s  %-5s  %-13s  %s%s\n' \
+        "$( (( tc )) && printf '\033[1m')" "CONTAINER ID" NAME IMAGE STATUS "MEM USAGE/LIMIT" PROCS "PID HOST->CTR" COMMAND \
+        "$( (( tc )) && printf '\033[0m')"
+    # sort by creation time, drop the sort key, then lay out the columns
+    printf '%s' "$rows" | sort -t $'\t' -k1,1n | cut -f2- |
+    while IFS=$'\t' read -r id name image status mem procs pidcol cmdline; do
+        local col="" rst=""
+        if (( tc )); then
+            rst=$'\033[0m'
+            case $status in Up*) col=$'\033[32m' ;; OOM*|Dead*) col=$'\033[31m' ;; *) col=$'\033[2m' ;; esac
+        fi
+        printf "%-12s  %-16s  %-11s  ${col}%-20s${rst}  %-16s  %-5s  %-13s  %s\n" \
+            "$id" "$name" "$image" "$status" "$mem" "$procs" "$pidcol" "$cmdline"
+    done
+}
+
+cmd_stats() {
+    (( $# )) || die "$E_USAGE" "usage: box stats <name|id>"
+    local id; id=$(resolve_container "$1")
+    is_running "$id" || die "$E_RUNTIME" "container '$(state_get "$id" NAME)' is not running"
+    local pid name cur lim peak cpu u1 u2 t1 t2 pct procs pmax plist
+    pid=$(state_get "$id" INIT_PID); name=$(state_get "$id" NAME)
+    lim=$(state_get "$id" MEM_BYTES); cpu=$(state_get "$id" CPU_PCT); pmax=$(state_get "$id" PIDS_MAX)
+    u1=$(cg_cpu_usec "$id"); t1=$(date +%s%N)
+    sleep 1
+    u2=$(cg_cpu_usec "$id"); t2=$(date +%s%N)
+    if [[ -n $u1 && -n $u2 ]]; then
+        pct=$(awk -v a="$u1" -v b="$u2" -v t1="$t1" -v t2="$t2" 'BEGIN { printf "%.1f", (b - a) * 100000 / (t2 - t1) }')
+    else
+        pct="n/a"
+    fi
+    cur=$(cg_mem_current "$id"); peak=$(cg_mem_peak "$id")
+    procs=$(cg_procs "$id" | wc -l)
+    printf '%s%s%s  (%s)\n' "$C_B" "$name" "$C_RST" "$id"
+    printf '  %-12s: %s  (container PID 1)\n' "host PID" "$pid"
+    printf '  %-12s: %s / %s\n' "memory" "$(human "${cur:-}")" "$(limit_h "$lim" unlimited)"
+    printf '  %-12s: %s\n' "memory peak" "$(human "${peak:-}")"
+    printf '  %-12s: %s%%  (limit %s, 1s sample)\n' "cpu usage" "$pct" "${cpu:-none}${cpu:+% of one core}"
+    printf '  %-12s: %s / %s\n' "processes" "$procs" "${pmax:-max}"
+    plist=$(cg_procs "$id" | paste -sd, -)
+    if [[ -n $plist ]]; then
+        printf '\n'
+        ps -o pid=HOST_PID -o ppid,user -o rss=RSS_KB -o pcpu,stat,args -p "$plist" 2>/dev/null |
+            sed 's/^/  /' || true
+    fi
+}
+
+cmd_logs() {
+    local follow=0 q=""
+    while (( $# )); do
+        case $1 in -f|--follow) follow=1 ;; *) q=$1 ;; esac
+        shift
+    done
+    local id; id=$(resolve_container "$q")
+    local log; log="$(cdir_of "$id")/console.log"
+    [[ -f $log ]] || die "$E_USAGE" "no logs: '$q' was not started with --detach"
+    if (( follow )); then tail -n +1 -f -- "$log"; else cat -- "$log"; fi
+}
+
+cmd_stop() {
+    local grace=$BOX_STOP_GRACE
+    local -a targets=()
+    while (( $# )); do
+        case $1 in
+            -t|--time) need_val "$@"; grace=$2; shift 2 ;;
+            -h|--help) printf 'usage: box stop [-t seconds] <name|id>...\n'; return 0 ;;
+            *) targets+=("$1"); shift ;;
+        esac
+    done
+    [[ $grace =~ ^[0-9]+$ ]] || die "$E_USAGE" "-t expects whole seconds"
+    (( ${#targets[@]} )) || die "$E_USAGE" "usage: box stop [-t seconds] <name|id>..."
+    local q id name i
+    for q in "${targets[@]}"; do
+        id=$(resolve_container "$q")
+        name=$(state_get "$id" NAME)
+        if ! is_running "$id"; then
+            info "'$name' is not running"
+            container_teardown "$id"
+            continue
+        fi
+        kill_container "$id" "$grace" || true
+        # give the supervisor a moment to record the real exit status
+        for (( i = 0; i < 30; i++ )); do
+            [[ $(state_get "$id" STATUS) == exited || ! -d $(cdir_of "$id") ]] && break
+            sleep 0.1
+        done
+        container_teardown "$id"
+        ok "stopped '$name' — namespaces gone, cgroup removed"
+    done
+}
+
+cmd_rm() {
+    local force=0
+    local -a targets=()
+    while (( $# )); do
+        case $1 in -f|--force) force=1 ;; *) targets+=("$1") ;; esac
+        shift
+    done
+    (( ${#targets[@]} )) || die "$E_USAGE" "usage: box rm [-f] <name|id>..."
+    local q id name
+    for q in "${targets[@]}"; do
+        id=$(resolve_container "$q")
+        name=$(state_get "$id" NAME)
+        if is_running "$id"; then
+            (( force )) || die "$E_RUNTIME" "'$name' is running — stop it first or use rm -f"
+            kill_container "$id" 0 || true
+        fi
+        container_teardown "$id"
+        remove_container_dir "$id"
+        ok "removed '$name'"
+    done
+}
+
+cmd_inspect() {
+    (( $# )) || die "$E_USAGE" "usage: box inspect <name|id>"
+    local id cdir pid ns mine theirs
+    id=$(resolve_container "$1")
+    cdir=$(cdir_of "$id")
+    printf '%s# state: %s/config%s\n' "$C_DIM" "$cdir" "$C_RST"
+    sort -- "$cdir/config"
+    printf 'ARGV='; tr '\0' ' ' < "$cdir/cmd"; printf '\n'
+    if is_running "$id"; then
+        pid=$(state_get "$id" INIT_PID)
+        printf '\n%s# namespaces of host PID %s (inode numbers; equal = shared with host)%s\n' "$C_DIM" "$pid" "$C_RST"
+        for ns in pid mnt uts ipc net user cgroup; do
+            [[ -e /proc/$pid/ns/$ns ]] || continue
+            theirs=$(readlink "/proc/$pid/ns/$ns"); mine=$(readlink "/proc/self/ns/$ns")
+            printf '%-7s %-22s %s\n' "$ns" "$theirs" "$([[ $theirs == "$mine" ]] && echo shared || echo ISOLATED)"
+        done
+        printf '\n%s# live cgroup limits%s\n' "$C_DIM" "$C_RST"
+        local d f
+        while read -r d; do
+            for f in memory.max memory.current memory.peak memory.swap.max cpu.max pids.max pids.current \
+                     memory.limit_in_bytes memory.usage_in_bytes cpu.cfs_quota_us cpu.cfs_period_us; do
+                [[ -r $d/$f ]] && printf '%-52s %s\n' "${d#"$CG_BASE"/}/$f" "$(cg_read "$d/$f")"
+            done
+        done < <(cg_dirs "$id")
+    fi
+    return 0
+}
+
+cmd_cleanup() {
+    local all=0 id d n=0 st sup
+    if [[ ${1:-} == --all || ${1:-} == -a ]]; then all=1; fi
+    info "reaping containers whose processes are gone…"
+    while read -r id; do
+        [[ -n $id ]] || continue
+        st=$(state_get "$id" STATUS)
+        if is_running "$id"; then continue; fi
+        sup=$(state_get "$id" SUPERVISOR_PID)
+        if [[ $sup =~ ^[0-9]+$ ]] && kill -0 "$sup" 2>/dev/null && [[ $st != exited ]]; then
+            continue                                    # still starting up
+        fi
+        if [[ $st == running || $st == created ]]; then
+            warn "container $(state_get "$id" NAME) ($id) died without its supervisor — reaping"
+            container_teardown "$id"; n=$(( n + 1 ))
+        fi
+        if (( all )); then remove_container_dir "$id"; n=$(( n + 1 )); fi
+    done < <(container_ids)
+    info "removing orphaned cgroups…"
+    for d in "$CG_BASE/$CG_PARENT"/*/ "$CG_BASE"/{memory,cpu,pids}/"$CG_PARENT"/*/; do
+        id=$(basename "$d")
+        if [[ ! -f $(cdir_of "$id")/config ]] || ! is_running "$id"; then
+            cg_write "$d/cgroup.kill" 1 || true
+            rmdir "$d" 2>/dev/null && { info "removed orphan cgroup ${d%/}"; n=$(( n + 1 )); }
+        fi
+    done
+    info "sweeping stray mounts under $BOX_ROOT…"
+    sweep_mounts "$BOX_ROOT"
+    rm -rf --one-file-system -- "${TMP_DIR:?}"/* 2>/dev/null || true
+    ok "cleanup complete ($n item(s) reaped); host mounts referencing ushell-box: $(grep -c ushell-box /proc/mounts || true)"
+}
+
+cmd_info() {
+    local ctrl="-" running=0 total=0 id
+    while read -r id; do
+        [[ -n $id ]] || continue
+        total=$(( total + 1 ))
+        is_running "$id" && running=$(( running + 1 ))
+    done < <(container_ids)
+    case $CG_VERSION in
+        2) ctrl=$(cg_read "$CG_BASE/cgroup.controllers") ;;
+        1) ctrl=$(awk 'NR > 1 && $4 == 1 { printf "%s ", $1 }' /proc/cgroups) ;;
+    esac
+    local wsl=no; grep -qi microsoft /proc/version 2>/dev/null && wsl=yes
+    printf '%sushell-box %s%s\n' "$C_B" "$BOX_VERSION" "$C_RST"
+    printf '  %-16s %s\n' "kernel" "$(uname -sr) ($(uname -m))"
+    printf '  %-16s %s\n' "distribution" "$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")"
+    printf '  %-16s %s\n' "WSL" "$wsl"
+    printf '  %-16s %s\n' "bash" "$BASH_VERSION"
+    printf '  %-16s %s\n' "util-linux" "$(unshare --version 2>/dev/null | awk '{ print $NF }')"
+    printf '  %-16s v%s  (%s)\n' "cgroups" "$CG_VERSION" "$( ((CG_VERSION)) && printf '%s' "$CG_BASE" || printf 'not available')"
+    printf '  %-16s %s\n' "controllers" "${ctrl:--}"
+    printf '  %-16s %s\n' "overlayfs" "$(overlay_usable && echo usable || echo "unavailable (copy mode)")"
+    printf '  %-16s %s  [%s]\n' "box root" "$BOX_ROOT" "$(fs_type "$BOX_ROOT")"
+    printf '  %-16s %s\n' "images" "$(find "$IMAGES_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+    printf '  %-16s %s running / %s total\n' "containers" "$running" "$total"
+    printf '  %-16s %s\n' "rootless test" "$(in_userns && echo "yes (user namespace)" || echo no)"
+}
+
+# ----------------------------------------------------------------------------
+#  Interactive menu  (REVA USP lab pattern: while true + case)
+# ----------------------------------------------------------------------------
+box_call() {    # run a sub-command in a fresh process so a failure can't kill the menu
+    local rc=0
+    "$BASH" "$SELF" "$@" || rc=$?
+    if (( rc != 0 )); then warn "'box $1' finished with exit status $rc"; fi
+    return 0
+}
+
+ask() {         # var prompt [default]
+    local __ans=""
+    read -r -p "    $2${3:+ [$3]}: " __ans || true
+    printf -v "$1" '%s' "${__ans:-${3:-}}"
+}
+
+menu_banner() {
+    local imgs running=0 id
+    imgs=$(find "$IMAGES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)
+    while read -r id; do [[ -n $id ]] && is_running "$id" && running=$(( running + 1 )); done < <(container_ids)
+    cat <<EOF
+
+${C_CYN}${C_B}  ┌──────────────────────────────────────────────────────────────┐
+  │              ushell-box  ·  micro-container engine           │
+  └──────────────────────────────────────────────────────────────┘${C_RST}
+  ${C_DIM}cgroups v${CG_VERSION} · images: ${imgs:-none} · running: ${running}${C_RST}
+
+  ${C_B}Images${C_RST}       1) Pull an image             2) List images
+  ${C_B}Containers${C_RST}   3) Run interactive shell     4) Run detached container
+               5) List containers (ps -a)   6) Exec into a container
+               7) Live stats                8) Stop a container
+               9) Remove a container        l) View container logs
+  ${C_B}System${C_RST}       i) System info               c) Cleanup orphans
+               d) Run demo.sh               0) Exit
+
+EOF
+}
+
+cmd_menu() {
+    [[ -t 0 ]] || die "$E_USAGE" "the menu needs an interactive terminal"
+    local choice img name mem cpu c rc
+    local -a args=() cmd=()
+    trap 'printf "\n"; warn "interrupted — choose 0 to leave the menu"' INT
+    while true; do
+        menu_banner
+        rc=0
+        read -r -p "  Select an option: " choice || rc=$?
+        if (( rc > 128 )); then continue; fi
+        if (( rc != 0 )); then printf '\n'; break; fi
+        case $choice in
+            1)  ask img "Image (alpine | ubuntu-mini)" alpine
+                box_call pull "$img" ;;
+            2)  box_call images ;;
+            3|4)
+                ask img  "Image" alpine
+                ask name "Container name (blank = auto)"
+                ask mem  "Memory limit, e.g. 64M (blank = none)"
+                ask cpu  "CPU limit in % of a core (blank = none)"
+                args=()
+                [[ -n $name ]] && args+=(--name "$name")
+                [[ -n $mem ]]  && args+=(--mem "$mem")
+                [[ -n $cpu ]]  && args+=(--cpu "$cpu")
+                if [[ $choice == 3 ]]; then
+                    info "type 'exit' to leave the container"
+                    box_call run --rm "${args[@]}" "$img"
+                else
+                    ask c "Command" "sleep 3600"
+                    read -r -a cmd <<< "$c"
+                    box_call run -d "${args[@]}" "$img" "${cmd[@]}"
+                fi ;;
+            5)  box_call ps -a ;;
+            6)  ask name "Container name or id"
+                ask c "Command" "/bin/sh"
+                read -r -a cmd <<< "$c"
+                box_call exec "$name" "${cmd[@]}" ;;
+            7)  ask name "Container name or id"; box_call stats "$name" ;;
+            8)  ask name "Container name or id"; box_call stop "$name" ;;
+            9)  ask name "Container name or id"; box_call rm -f "$name" ;;
+            l|L) ask name "Container name or id"; box_call logs "$name" ;;
+            i|I) box_call info ;;
+            c|C) box_call cleanup ;;
+            d|D) if [[ -f ${SELF%/*}/demo.sh ]]; then "$BASH" "${SELF%/*}/demo.sh" || true
+                 else warn "demo.sh not found next to $SELF"; fi ;;
+            0|q|Q|exit) ok "bye"; break ;;
+            '') continue ;;
+            *)  warn "invalid choice '$choice'" ;;
+        esac
+        read -r -s -n 1 -p "  ${C_DIM}press any key to return to the menu…${C_RST}" _ || true
+        printf '\n'
+    done
+    trap 'cleanup INT' INT
+}
+
+usage() {
+    cat <<EOF
+${C_B}ushell-box ${BOX_VERSION}${C_RST} — a Bash-native micro-container engine (namespaces + chroot + cgroups)
+
+${C_B}usage:${C_RST} box <command> [options]
+
+${C_B}images${C_RST}
+  pull [--force] [alpine|ubuntu-mini]   download + verify + cache a root filesystem
+  images                                list cached images (size, inode, mtime)
+  rmi <image>                           delete a cached image
+
+${C_B}containers${C_RST}
+  run [OPTIONS] <image> [cmd...]        create and start a container (see: box run --help)
+  ps [-a] [-q]                          list containers (host PID -> container PID)
+  exec <name|id> [cmd...]               run a command inside a running container
+  stats <name|id>                       memory / CPU / process usage from the cgroup
+  logs [-f] <name|id>                   console output of a detached container
+  stop [-t secs] <name|id>...           SIGTERM, grace period, SIGKILL, tear down
+  rm [-f] <name|id>...                  remove a stopped (or, with -f, running) container
+  inspect <name|id>                     state, namespaces and live cgroup limits
+
+${C_B}system${C_RST}
+  menu                                  interactive menu-driven interface
+  info                                  kernel / cgroup / overlayfs capabilities
+  cleanup [--all]                       reap dead containers, orphan cgroups, stray mounts
+  help | version
+
+${C_B}environment${C_RST}
+  BOX_ROOT=$BOX_ROOT   BOX_STOP_GRACE=$BOX_STOP_GRACE   BOX_PIDS_MAX=$BOX_PIDS_MAX
+  BOX_ROOTFS_MODE=auto|overlay|copy   BOX_CGROUP=auto|v2|v1|none   NO_COLOR=1   BOX_DEBUG=1
+
+${C_B}exit codes${C_RST}  0 ok · 1 bad arguments · 2 not root · 3 runtime/isolation error
+            (foreground 'box run' returns the container's own exit status)
+EOF
+}
+
