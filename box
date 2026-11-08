@@ -134,3 +134,82 @@ install_traps() {
     trap 'cleanup HUP'  HUP
 }
 
+# =============================================================================
+#  §3  Privilege handling
+# =============================================================================
+require_root() {
+    (( EUID == 0 )) && return 0
+    if command -v sudo >/dev/null 2>&1 && { [[ -t 0 ]] || sudo -n true 2>/dev/null; }; then
+        info "'box $1' needs root (namespaces, mounts, cgroups) — re-executing via sudo"
+        exec sudo --preserve-env=BOX_ROOT,BOX_STOP_GRACE,BOX_PIDS_MAX,BOX_ROOTFS_MODE,BOX_CGROUP,BOX_QUIET,BOX_DEBUG,NO_COLOR,TERM \
+            "$BASH" "$SELF" "${ORIG_ARGS[@]}"
+    fi
+    die "$E_PERM" "'box $1' must run as root — try: sudo $SELF ${ORIG_ARGS[*]}"
+}
+
+# True when we are root only inside a user namespace (rootless test mode).
+in_userns() {
+    local a b c
+    read -r a b c < /proc/self/uid_map 2>/dev/null || return 1
+    [[ ! ($a == 0 && $b == 0 && $c == 4294967295) ]]
+}
+
+# =============================================================================
+#  §4  Small utilities
+# =============================================================================
+gen_id() { od -An -N6 -tx1 /dev/urandom | tr -d ' \n'; }
+
+# "50M" → 52428800. Accepts K/M/G with optional "i"/"B" suffix, or raw bytes.
+parse_size() {
+    local s=${1^^}
+    [[ $s =~ ^([0-9]+)([KMG]?)I?B?$ ]] || return 1
+    local n=${BASH_REMATCH[1]} u=${BASH_REMATCH[2]}
+    case $u in
+        K) n=$(( n * 1024 )) ;;
+        M) n=$(( n * 1024 * 1024 )) ;;
+        G) n=$(( n * 1024 * 1024 * 1024 )) ;;
+    esac
+    printf '%s\n' "$n"
+}
+
+limit_h() { # bytes|"" [fallback] → "50.0MiB" or the fallback word
+    if [[ -n ${1:-} ]]; then human "$1"; else printf '%s\n' "${2:-max}"; fi
+}
+
+human() {   # bytes → "12.3MiB"
+    [[ ${1:-} =~ ^[0-9]+$ ]] || { printf '%s\n' "${1:--}"; return 0; }
+    awk -v b="$1" 'BEGIN { split("B KiB MiB GiB TiB", u, " "); i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        printf (i == 1 ? "%d%s\n" : "%.1f%s\n"), b, u[i] }'
+}
+
+duration() {  # seconds → "42s" / "7m" / "3h" / "2d"
+    local s=$1
+    if   (( s < 60 ));    then printf '%ss\n' "$s"
+    elif (( s < 3600 ));  then printf '%sm\n' $(( s / 60 ))
+    elif (( s < 86400 )); then printf '%sh\n' $(( s / 3600 ))
+    else                       printf '%sd\n' $(( s / 86400 ))
+    fi
+}
+
+# Field 22 of /proc/<pid>/stat (start time) — guards against PID reuse.
+proc_starttime() {
+    local s
+    { s=$(< "/proc/$1/stat"); } 2>/dev/null || return 1
+    local -a f
+    read -ra f <<< "${s##*) }"
+    printf '%s\n' "${f[19]}"
+}
+
+fs_type() { stat -fc %T -- "$1" 2>/dev/null || printf 'unknown\n'; }
+
+init_dirs() {
+    mkdir -p "$IMAGES_DIR" "$CONTAINERS_DIR" "$TMP_DIR"
+    chmod 0711 "$BOX_ROOT" 2>/dev/null || true
+    case $(fs_type "$BOX_ROOT") in
+        9p|v9fs|fuseblk|drvfs)
+            warn "BOX_ROOT=$BOX_ROOT is on a Windows/9p filesystem; chroot, overlayfs and"
+            warn "unix permissions misbehave there. Use the default /var/lib/ushell-box." ;;
+    esac
+}
+
