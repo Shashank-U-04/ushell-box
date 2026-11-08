@@ -623,3 +623,199 @@ cmd_rmi() {
 
 image_present() { [[ -d $IMAGES_DIR/$1/rootfs ]]; }
 
+# =============================================================================
+#  §8  Container lifecycle — host side (supervisor)
+# =============================================================================
+overlay_usable() {
+    grep -qw overlay /proc/filesystems 2>/dev/null || modprobe overlay 2>/dev/null || true
+    grep -qw overlay /proc/filesystems 2>/dev/null || return 1
+    case $(fs_type "$BOX_ROOT") in overlayfs|9p|v9fs|fuseblk|nfs|tmpfs) return 1 ;; esac
+    return 0
+}
+
+prepare_rootfs() {      # id image
+    local id=$1 cdir lower mode=$BOX_ROOTFS_MODE
+    cdir=$(cdir_of "$id")
+    lower="$IMAGES_DIR/$2/rootfs"
+    [[ -d $lower ]] || die "$E_RUNTIME" "image rootfs missing: $lower"
+    if [[ $mode == auto ]]; then
+        if overlay_usable; then mode=overlay; else mode=copy; fi
+    fi
+    case $mode in
+        overlay)
+            mkdir -p "$cdir/upper" "$cdir/work" "$cdir/merged"
+            state_set "$id" ROOTFS_MODE overlay ROOTFS "$cdir/merged" LOWER "$lower" ;;
+        copy)
+            info "overlayfs unavailable — copying image into a private rootfs"
+            mkdir -p "$cdir/rootfs"
+            cp -a -- "$lower/." "$cdir/rootfs/"
+            state_set "$id" ROOTFS_MODE copy ROOTFS "$cdir/rootfs" LOWER "$lower" ;;
+        *) die "$E_USAGE" "BOX_ROOTFS_MODE must be auto, overlay or copy" ;;
+    esac
+}
+
+# The container's PID 1 is the child that `unshare --fork` creates. Find it and
+# confirm it really lives in a different PID namespace than we do.
+find_ns_child() {
+    local parent=$1 me c ns i
+    me=$(readlink /proc/self/ns/pid)
+    for (( i = 0; i < 200; i++ )); do
+        kill -0 "$parent" 2>/dev/null || return 1
+        c=""
+        { read -r c _ < "/proc/$parent/task/$parent/children"; } 2>/dev/null || true
+        [[ -z $c ]] && c=$(pgrep -P "$parent" 2>/dev/null | head -n1) || true
+        if [[ -n $c ]]; then
+            ns=$(readlink "/proc/$c/ns/pid" 2>/dev/null) || ns=""
+            if [[ -n $ns && $ns != "$me" ]]; then printf '%s\n' "$c"; return 0; fi
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+record_exit() {         # id rc — capture accounting *before* the cgroup is removed
+    local id=$1 rc=$2 oom peak name
+    [[ -d $(cdir_of "$id") ]] || return 0
+    [[ $(state_get "$id" STATUS) == exited ]] && return 0
+    oom=$(cg_oom_kills "$id"); oom=${oom:-0}
+    peak=$(cg_mem_peak "$id")
+    name=$(state_get "$id" NAME)
+    state_set "$id" STATUS exited EXIT_CODE "$rc" FINISHED "$(date +%s)" \
+        OOM_KILLED "$(( oom > 0 ? 1 : 0 ))" MEM_PEAK "${peak:-}"
+    if (( oom > 0 )); then
+        warn "container '$name' was OOM-killed by the cgroup memory controller" \
+             "(limit $(human "$(state_get "$id" MEM_BYTES)"), peak $(human "$peak"), exit $rc)"
+    elif (( rc > 128 )); then
+        info "container '$name' terminated by SIG$(kill -l $(( rc - 128 )) 2>/dev/null || echo '?') (exit $rc)"
+    else
+        info "container '$name' exited with code $rc"
+    fi
+}
+
+kill_container() {      # id grace_seconds — SIGTERM, wait, then SIGKILL
+    local id=$1 grace=${2:-$BOX_STOP_GRACE} pid i
+    is_running "$id" || return 0
+    pid=$(state_get "$id" INIT_PID)
+    info "SIGTERM → container init (host PID $pid), grace ${grace}s"
+    kill -TERM "$pid" 2>/dev/null || true
+    for (( i = 0; i < grace * 10; i++ )); do
+        is_running "$id" || { ok "container exited gracefully"; return 0; }
+        sleep 0.1
+    done
+    (( grace > 0 )) && warn "still alive after ${grace}s (PID 1 ignores signals it has no handler for)"
+    info "SIGKILL → host PID $pid (kill -9 is always delivered from the parent namespace)"
+    kill -KILL "$pid" 2>/dev/null || true
+    for (( i = 0; i < 50; i++ )); do
+        is_running "$id" || return 0
+        sleep 0.1
+    done
+    warn "init PID $pid survived SIGKILL?!"
+    return 1
+}
+
+# Unmount anything under <dir> that is visible in *our* mount table. Normally
+# there is nothing (all mounts live in the container's namespace) — this is the
+# belt-and-braces guard before any rm -rf.
+sweep_mounts() {
+    local dir=$1 m
+    local -a mps=()
+    mapfile -t mps < <(D="$dir" awk '$2 == ENVIRON["D"] || index($2, ENVIRON["D"] "/") == 1 { print $2 }' /proc/mounts | sort -r)
+    for m in "${mps[@]}"; do
+        m=$(printf '%b' "$m")                       # /proc/mounts escapes spaces as \040
+        umount -l -- "$m" 2>/dev/null && warn "lazily unmounted leftover $m"
+    done
+    return 0
+}
+
+remove_container_dir() {
+    local id=$1 cdir
+    cdir=$(cdir_of "$id")
+    [[ -d $cdir ]] || return 0
+    sweep_mounts "$cdir"
+    if awk -v d="$cdir/" 'index($2 "/", d) == 1 { found = 1 } END { exit !found }' /proc/mounts; then
+        die "$E_RUNTIME" "refusing to delete $cdir: something is still mounted under it"
+    fi
+    rm -rf --one-file-system -- "$cdir"
+}
+
+# Idempotent: safe to call from the supervisor's trap, from `box stop`, from
+# `box rm -f` and from `box cleanup`, in any order, any number of times.
+container_teardown() {  # id
+    local id=$1 shim rc=""
+    [[ -f $(cdir_of "$id")/config ]] || return 0
+    if is_running "$id"; then kill_container "$id" 2 || true; fi
+    shim=$(state_get "$id" SHIM_PID)
+    if [[ $shim =~ ^[0-9]+$ && $(state_get "$id" SUPERVISOR_PID) == "$$" ]]; then
+        wait "$shim" 2>/dev/null && rc=0 || rc=$?
+        [[ $rc == 127 ]] && rc=""                     # already reaped
+    fi
+    if [[ $(state_get "$id" STATUS) != exited ]]; then
+        if [[ -z $rc ]]; then
+            if [[ -n $_EXIT_SIGNAL || $(state_get "$id" STATUS) == running ]]; then rc=137; else rc=$_EXIT_RC; fi
+        fi
+        record_exit "$id" "$rc"
+    fi
+    cg_destroy "$id"
+    sweep_mounts "$(cdir_of "$id")"
+    [[ $(state_get "$id" AUTO_REMOVE) == 1 ]] && remove_container_dir "$id"
+    return 0
+}
+
+# Runs the container to completion. Used directly by foreground `box run` and
+# via `box __supervise` (in a setsid'd background process) for `box run -d`.
+supervise() {
+    local id=$1 name image mem cpu pids rc=0 f
+    name=$(state_get "$id" NAME)
+    image=$(state_get "$id" IMAGE)
+    mem=$(state_get "$id" MEM_BYTES)
+    cpu=$(state_get "$id" CPU_PCT)
+    pids=$(state_get "$id" PIDS_MAX)
+    state_set "$id" SUPERVISOR_PID "$$"
+    cleanup_push container_teardown "$id"
+
+    prepare_rootfs "$id" "$image"
+
+    # ---- 1. cgroup: create + limits (before the container exists) --------
+    local -a procs_files=()
+    if (( CG_VERSION > 0 )) && cg_create "$id" "$mem" "$cpu" "$pids"; then
+        while read -r f; do procs_files+=("$f/cgroup.procs"); done < <(cg_dirs "$id")
+        state_set "$id" CGROUP "$(cg_dirs "$id" | paste -sd, -)" CG_VERSION "$CG_VERSION"
+        info "cgroup v$CG_VERSION: memory=$(limit_h "$mem" unlimited)" \
+             "cpu=${cpu:-unlimited}${cpu:+%} pids=${pids:-max}"
+    elif [[ -n $mem || -n $cpu ]]; then
+        die "$E_RUNTIME" "cgroups unavailable (version=$CG_VERSION) — cannot enforce --mem/--cpu"
+    else
+        warn "cgroups unavailable — running without resource accounting"
+        state_set "$id" CG_VERSION 0
+    fi
+
+    # ---- 2. namespaces: fork a shim, join the cgroup, exec unshare --------
+    #   stage 1 (here):        unshare --mount --uts --ipc  → box __init (setup)
+    #   stage 2 (in __init):   unshare --pid                → reaper → PID 1
+    local -a ns_flags=(--mount --uts --ipc --propagation private)
+    local -a sigreset=()
+    env --default-signal=INT true 2>/dev/null && sigreset=(env --default-signal=INT,QUIT,PIPE)
+    info "unshare --mount --uts --ipc → setup → unshare --pid → chroot $(state_get "$id" ROOTFS)"
+    (
+        # builtins only between fork and exec: the cgroup is inherited by
+        # every descendant, so the limits apply from the very first instruction
+        for f in "${procs_files[@]}"; do
+            printf '%s\n' "$BASHPID" > "$f" || exit "$E_RUNTIME"
+        done
+        exec "${sigreset[@]}" unshare "${ns_flags[@]}" -- "$BASH" "$SELF" __init "$id"
+    ) <&0 &
+    local shim=$!
+    state_set "$id" SHIM_PID "$shim" STATUS running STARTED "$(date +%s)"
+
+    local init_pid=""
+    if init_pid=$(find_ns_child "$shim"); then
+        state_set "$id" INIT_PID "$init_pid" INIT_START "$(proc_starttime "$init_pid" || true)"
+        ok "container '$name' (${id}) running — host PID $init_pid ⇄ container PID 1"
+    fi
+
+    # ---- 3. wait (interruptible: the INT/TERM traps fire immediately) -----
+    wait "$shim" || rc=$?
+    record_exit "$id" "$rc"
+    return "$rc"
+}
+
